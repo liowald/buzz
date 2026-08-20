@@ -52,6 +52,7 @@ import 'ephemeral_channel_display.dart';
 import 'emoji_picker.dart';
 import 'ime_metrics_settle_observer.dart';
 import 'jump_to_latest_button.dart';
+import 'jump_to_latest_switcher.dart';
 import 'mobile_huddle_controller.dart';
 import 'members_sheet.dart';
 import 'message_actions.dart';

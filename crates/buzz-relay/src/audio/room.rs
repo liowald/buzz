@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! Client A → WS binary frame → Room::broadcast_frame → Client B, C, ...
-//!                                                        (1-byte peer_index prefix)
+//!                                                        (2-byte [peer_index][epoch] prefix)
 //! ```
 //!
 //! Frames are opaque Opus bytes — the relay never decodes audio.
@@ -11,7 +11,7 @@
 use buzz_core::CommunityId;
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -27,6 +27,11 @@ pub struct AudioPeer {
     pub ctrl_tx: mpsc::Sender<PeerCtrl>,
     /// Stable 0-254 index assigned at join; prefixed onto relayed frames.
     pub peer_index: u8,
+    /// Per-index reuse generation. Incremented each time this `peer_index` is
+    /// (re)assigned to a new occupant, so a frame authored by a departed peer
+    /// can be told apart from one authored by the peer that later reused the
+    /// same index. Prefixed onto relayed frames alongside `peer_index`.
+    pub epoch: u8,
 }
 
 /// Control message for a single peer (separate from audio frames).
@@ -56,6 +61,10 @@ pub struct RosterPeer {
     pub pubkey: String,
     /// Owner-assigned media routing index.
     pub peer_index: u8,
+    /// Per-index reuse generation for `peer_index` (see [`AudioPeer::epoch`]).
+    /// Carried in roster snapshots/deltas so receivers can fence media frames
+    /// authored by a prior occupant of the same index.
+    pub epoch: u8,
 }
 
 /// A complete owner-roster snapshot at one monotonic revision.
@@ -79,9 +88,22 @@ pub struct RosterDelta {
     pub left: Option<RosterPeer>,
 }
 
-/// Successful local admission: peer ID, routing index, audio/control receivers,
-/// and the authoritative roster revision assigned to the join.
+/// Successful local admission: peer ID, routing index, per-index epoch,
+/// audio/control receivers, and the authoritative roster revision assigned to
+/// the join.
 pub type PeerAdmission = (
+    Uuid,
+    u8,
+    u8,
+    mpsc::Receiver<Bytes>,
+    mpsc::Receiver<PeerCtrl>,
+    u64,
+);
+
+/// Successful admission at an owner-assigned index: peer ID, per-index epoch,
+/// audio/control receivers, and the roster revision. The routing index is
+/// omitted because the caller supplied it.
+pub type IndexedPeerAdmission = (
     Uuid,
     u8,
     mpsc::Receiver<Bytes>,
@@ -124,6 +146,12 @@ struct AdmissionGuard {
     /// Routing identities held by currently connected peers. Owner-assigned
     /// mesh identities share this set with locally allocated identities.
     active_indices: HashSet<u8>,
+    /// Per-index reuse generation. `next_epoch_for(idx)` returns the epoch to
+    /// stamp on the next occupant of `idx` and advances the counter, so every
+    /// (re)assignment of an index gets a distinct, monotonically increasing
+    /// (mod 256) epoch. A frame carrying a stale epoch for its index was
+    /// authored by a departed occupant and is fenced by receivers.
+    index_epochs: HashMap<u8, u8>,
     ended: bool,
     /// Pinned huddle audio protocol version for this room.
     ///
@@ -152,21 +180,33 @@ impl AdmissionGuard {
         Self {
             next_candidate: 0,
             active_indices: HashSet::new(),
+            index_epochs: HashMap::new(),
             ended: false,
             pinned_version: None,
             roster_revision: 0,
         }
     }
 
-    fn alloc(&mut self) -> Option<u8> {
+    fn alloc(&mut self) -> Option<(u8, u8)> {
         for _ in 0..255 {
             let idx = self.next_candidate;
             self.next_candidate = if idx == 254 { 0 } else { idx + 1 };
             if self.active_indices.insert(idx) {
-                return Some(idx);
+                return Some((idx, self.next_epoch_for(idx)));
             }
         }
         None
+    }
+
+    /// Epoch to stamp on the next occupant of `idx`, advancing the per-index
+    /// counter. The first occupant of an index gets epoch 0; each later reuse
+    /// increments (wrapping at 256, which is astronomically larger than the
+    /// number of in-flight frames a stale occupant could have queued).
+    fn next_epoch_for(&mut self, idx: u8) -> u8 {
+        let slot = self.index_epochs.entry(idx).or_insert(0);
+        let epoch = *slot;
+        *slot = slot.wrapping_add(1);
+        epoch
     }
 }
 
@@ -260,7 +300,7 @@ impl Room {
                 });
             }
         }
-        let peer_index = g.alloc().ok_or(AdmissionError::Full)?;
+        let (peer_index, epoch) = g.alloc().ok_or(AdmissionError::Full)?;
         // Pin the room version on the first successful index allocation. We
         // pin *after* alloc so a Full error doesn't accidentally set the
         // version for a peer that didn't actually join.
@@ -275,18 +315,23 @@ impl Room {
                 audio_tx,
                 ctrl_tx,
                 peer_index,
+                epoch,
             },
         );
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let revision = g.roster_revision;
         let delta = RosterDelta {
             revision,
-            joined: Some(RosterPeer { pubkey, peer_index }),
+            joined: Some(RosterPeer {
+                pubkey,
+                peer_index,
+                epoch,
+            }),
             left: None,
         };
         let _ = self.roster_tx.send(delta);
         drop(g); // Release lock after ordered roster publication.
-        Ok((peer_id, peer_index, audio_rx, ctrl_rx, revision))
+        Ok((peer_id, peer_index, epoch, audio_rx, ctrl_rx, revision))
     }
 
     /// Add a non-owner ingress peer at the index already allocated by the
@@ -297,7 +342,7 @@ impl Room {
         pubkey: String,
         requested_version: u8,
         peer_index: u8,
-    ) -> Result<(Uuid, mpsc::Receiver<Bytes>, mpsc::Receiver<PeerCtrl>, u64), AdmissionError> {
+    ) -> Result<IndexedPeerAdmission, AdmissionError> {
         let mut g = self.guard.lock().map_err(|_| AdmissionError::Ended)?;
         if g.ended {
             return Err(AdmissionError::Ended);
@@ -315,6 +360,7 @@ impl Room {
         }
         g.pinned_version.get_or_insert(requested_version);
         g.active_indices.insert(peer_index);
+        let epoch = g.next_epoch_for(peer_index);
         // Continue local allocation after the newest owner-assigned identity.
         // The cursor wraps, so a high mesh index cannot burn the lower space.
         g.next_candidate = if peer_index == 254 { 0 } else { peer_index + 1 };
@@ -329,18 +375,23 @@ impl Room {
                 audio_tx,
                 ctrl_tx,
                 peer_index,
+                epoch,
             },
         );
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let revision = g.roster_revision;
         let delta = RosterDelta {
             revision,
-            joined: Some(RosterPeer { pubkey, peer_index }),
+            joined: Some(RosterPeer {
+                pubkey,
+                peer_index,
+                epoch,
+            }),
             left: None,
         };
         let _ = self.roster_tx.send(delta);
         drop(g);
-        Ok((peer_id, audio_rx, ctrl_rx, revision))
+        Ok((peer_id, epoch, audio_rx, ctrl_rx, revision))
     }
 
     /// Remove a peer and release its routing identity for a later allocator
@@ -358,6 +409,7 @@ impl Room {
             left: Some(RosterPeer {
                 pubkey: peer.pubkey,
                 peer_index: peer.peer_index,
+                epoch: peer.epoch,
             }),
         };
         let _ = self.roster_tx.send(delta.clone());
@@ -382,6 +434,7 @@ impl Room {
             left: Some(RosterPeer {
                 pubkey: peer.pubkey,
                 peer_index,
+                epoch: peer.epoch,
             }),
         };
         // Only the first task to see empty + !ended wins the auto-end.
@@ -399,17 +452,17 @@ impl Room {
     }
 
     /// Fan-out a binary frame to all peers except the sender.
-    /// Prepends the sender's `peer_index` as a 1-byte prefix.
-    /// Drops on full buffer — real-time audio never queues.
+    /// Prepends the sender's `peer_index` and per-index `epoch` as a 2-byte
+    /// prefix. Drops on full buffer — real-time audio never queues.
     pub fn broadcast_frame(&self, sender_id: Uuid, frame: Bytes) {
-        let sender_index = match self.peers.get(&sender_id) {
-            Some(p) => p.peer_index,
+        let (sender_index, sender_epoch) = match self.peers.get(&sender_id) {
+            Some(p) => (p.peer_index, p.epoch),
             None => return,
         };
 
-        // Prepend peer_index as 1-byte header.
-        let mut prefixed = bytes::BytesMut::with_capacity(1 + frame.len());
-        prefixed.extend_from_slice(&[sender_index]);
+        // Prepend [peer_index][epoch] as a 2-byte header.
+        let mut prefixed = bytes::BytesMut::with_capacity(2 + frame.len());
+        prefixed.extend_from_slice(&[sender_index, sender_epoch]);
         prefixed.extend_from_slice(&frame);
         let prefixed = prefixed.freeze();
 
@@ -481,6 +534,7 @@ impl Room {
             .map(|e| RosterPeer {
                 pubkey: e.pubkey.clone(),
                 peer_index: e.peer_index,
+                epoch: e.epoch,
             })
             .collect::<Vec<_>>();
         peers.sort_by_key(|peer| peer.peer_index);
@@ -583,7 +637,7 @@ mod tests {
         let (_local_id, local_index, ..) = room.add_peer("owner-local".into(), 2).unwrap();
         assert_eq!(local_index, 0);
 
-        let (remote_id, _audio, _ctrl, _revision) = room
+        let (remote_id, _epoch, _audio, _ctrl, _revision) = room
             .add_peer_at_index("remote".into(), 2, 7)
             .expect("owner-assigned index admits");
         assert_eq!(room.peers.get(&remote_id).unwrap().peer_index, 7);
@@ -598,7 +652,7 @@ mod tests {
     #[test]
     fn active_owner_assigned_index_cannot_be_readmitted() {
         let room = fresh_room();
-        let (_remote_id, _audio, _ctrl, _revision) = room
+        let (_remote_id, _epoch, _audio, _ctrl, _revision) = room
             .add_peer_at_index("remote".into(), 2, 7)
             .expect("owner-assigned index admits");
 
@@ -612,7 +666,7 @@ mod tests {
     #[test]
     fn owner_assigned_high_index_does_not_exhaust_local_allocation() {
         let room = fresh_room();
-        let (remote_id, _audio, _ctrl, _revision) = room
+        let (remote_id, _epoch, _audio, _ctrl, _revision) = room
             .add_peer_at_index("remote".into(), 2, 254)
             .expect("high owner-assigned index admits");
         room.remove_peer(remote_id).expect("remote peer leaves");
@@ -647,6 +701,7 @@ mod tests {
             vec![RosterPeer {
                 pubkey: "bob".into(),
                 peer_index: bob_index,
+                epoch: 0,
             }]
         );
     }
@@ -717,7 +772,7 @@ mod tests {
         let channel_id = Uuid::new_v4();
 
         let room1 = manager.get_or_create(community_id, channel_id);
-        let (peer_id, _, _, _, _) = room1
+        let (peer_id, _, _, _, _, _) = room1
             .add_peer("alice".to_string(), 2)
             .expect("first peer admits");
         // Last peer leaves and ends the room atomically.
@@ -778,14 +833,14 @@ mod tests {
     #[test]
     fn peer_indices_are_not_reused_within_a_room_generation() {
         let room = fresh_room();
-        let (alice_id, alice_idx, _, _, _) =
+        let (alice_id, alice_idx, _, _, _, _) =
             room.add_peer("alice".to_string(), 2).expect("alice admits");
-        let (_keeper_id, keeper_idx, _, _, _) = room
+        let (_keeper_id, keeper_idx, _, _, _, _) = room
             .add_peer("keeper".to_string(), 2)
             .expect("keeper admits");
 
         room.remove_peer(alice_id).expect("alice leaves");
-        let (_, bob_idx, _, _, _) = room
+        let (_, bob_idx, _, _, _, _) = room
             .add_peer("bob".to_string(), 2)
             .expect("bob admits at v=2");
 
@@ -795,6 +850,57 @@ mod tests {
             bob_idx, 2,
             "a departed peer index must not be immediately reused",
         );
+    }
+
+    /// A reused peer index carries a distinct epoch from its prior occupant,
+    /// so receivers can fence media authored before the reassignment. Rotation
+    /// still holds (the index is not immediately reused), but even after the
+    /// allocator wraps back, the epoch advances.
+    #[test]
+    fn reused_peer_index_gets_a_distinct_epoch() {
+        let room = fresh_room();
+        // First occupant of index 0 gets epoch 0.
+        let (alice_id, alice_index, alice_epoch, ..) =
+            room.add_peer("alice".into(), 2).expect("alice admits");
+        assert_eq!(alice_index, 0);
+        assert_eq!(alice_epoch, 0);
+        room.remove_peer(alice_id).expect("alice leaves");
+
+        // Force the allocator cursor back to 0 so the next admit reuses index 0.
+        // A single owner-assigned admit at 254 sets next_candidate to wrap to 0.
+        let (_high_id, high_epoch, ..) = room
+            .add_peer_at_index("high".into(), 2, 254)
+            .expect("high owner index admits");
+        assert_eq!(high_epoch, 0, "index 254 is a first occupant");
+
+        let (_bob_id, bob_index, bob_epoch, ..) =
+            room.add_peer("bob".into(), 2).expect("bob admits");
+        assert_eq!(bob_index, 0, "cursor wrapped to reuse index 0");
+        assert_eq!(
+            bob_epoch, 1,
+            "reused index 0 must advance its epoch past alice's"
+        );
+    }
+
+    /// The epoch stamped on a fanned-out frame matches the sender's current
+    /// per-index epoch, and differs after the index is reused.
+    #[test]
+    fn broadcast_frame_prefixes_index_and_current_epoch() {
+        let room = fresh_room();
+        let (sender_id, sender_index, sender_epoch, ..) =
+            room.add_peer("sender".into(), 2).expect("sender admits");
+        let (_listener_id, _li, _le, mut listener_rx, _ctrl, _rev) = room
+            .add_peer("listener".into(), 2)
+            .expect("listener admits");
+
+        room.broadcast_frame(sender_id, Bytes::from_static(&[0xAB, 0xCD]));
+        let got = listener_rx.try_recv().expect("listener receives frame");
+        assert_eq!(
+            &got[..2],
+            &[sender_index, sender_epoch],
+            "frame carries [peer_index][epoch]"
+        );
+        assert_eq!(&got[2..], &[0xAB, 0xCD], "opaque payload is untouched");
     }
 
     #[test]
@@ -817,8 +923,9 @@ mod tests {
     #[test]
     fn version_pin_persists_across_peer_churn() {
         let room = fresh_room();
-        let (alice_id, _, _, _, _) = room.add_peer("alice".to_string(), 2).expect("alice admits");
-        let (_keeper_id, _, _, _, _) = room
+        let (alice_id, _, _, _, _, _) =
+            room.add_peer("alice".to_string(), 2).expect("alice admits");
+        let (_keeper_id, _, _, _, _, _) = room
             .add_peer("keeper".to_string(), 2)
             .expect("keeper admits");
         room.remove_peer(alice_id);

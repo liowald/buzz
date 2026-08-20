@@ -232,6 +232,13 @@ abstract interface class HuddleMedia {
 
   Future<HuddleMediaCapabilities> discoverCapabilities();
   Future<HuddleMicrophonePermission> requestMicrophonePermission();
+
+  /// Open the OS app-settings screen so the user can grant a microphone
+  /// permission that was previously denied. Returns `true` when the settings
+  /// UI was launched. A no-op-safe fallback returns `false` on platforms that
+  /// cannot open settings (e.g. the plugin is missing).
+  Future<bool> openSystemSettings();
+
   Future<void> prepare();
   Future<void> start();
   Future<void> setMuted(bool muted);
@@ -341,6 +348,21 @@ final class MethodChannelHuddleMedia implements HuddleMedia {
       final failure = _platformFailure(error);
       _fail(failure);
       throw failure;
+    }
+  }
+
+  @override
+  Future<bool> openSystemSettings() async {
+    _ensureNotDisposed();
+    try {
+      final opened = await _channel.invokeMethod<bool>('openSystemSettings');
+      return opened ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      // Opening settings is a best-effort recovery affordance; a platform
+      // failure here must not tear down the (already-failed) session.
+      return false;
     }
   }
 

@@ -78,6 +78,27 @@ void main() {
     expect(media.state.phase, HuddleMediaPhase.unavailable);
   });
 
+  test('opens system settings and reports the native launch result', () async {
+    var invoked = 0;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      invoked += 1;
+      expect(call.method, 'openSystemSettings');
+      return true;
+    });
+    final media = MethodChannelHuddleMedia(channel: channel);
+    addTearDown(media.dispose);
+
+    expect(await media.openSystemSettings(), isTrue);
+    expect(invoked, 1);
+  });
+
+  test('missing native settings support degrades to not launched', () async {
+    final media = MethodChannelHuddleMedia(channel: channel);
+    addTearDown(media.dispose);
+
+    expect(await media.openSystemSettings(), isFalse);
+  });
+
   test('starts unmuted and forwards direct mute and speaker changes', () async {
     final calls = <MethodCall>[];
     messenger.setMockMethodCallHandler(channel, (call) async {

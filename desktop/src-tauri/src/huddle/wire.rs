@@ -12,7 +12,15 @@
 //! ## v2 (this commit)
 //!
 //! Client → relay: `<header: [u8; 8]><opus_bytes>`
-//! Relay   → client: `<peer_index: u8><header: [u8; 8]><opus_bytes>`
+//! Relay   → client: `<peer_index: u8><epoch: u8><header: [u8; 8]><opus_bytes>`
+//!
+//! The relay prefixes each forwarded frame with the sender's stable
+//! `peer_index` and the current occupancy `epoch` of that index. The epoch
+//! advances each time a slot is reused by a new occupant, so a client can
+//! fence a frame authored by a departed occupant that arrives after its index
+//! is reassigned — it carries the stale epoch and is dropped rather than
+//! mis-attributed. The client's own send path is unaffected: it emits only
+//! `<header><opus_bytes>` and the relay stamps the prefix.
 //!
 //! Header layout (8 bytes, network byte order, big-endian):
 //!

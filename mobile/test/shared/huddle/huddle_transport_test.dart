@@ -66,12 +66,13 @@ void main() {
         emits(
           isA<HuddleRemoteAudioFrame>()
               .having((frame) => frame.peerIndex, 'peer index', 4)
+              .having((frame) => frame.epoch, 'epoch', 0)
               .having((frame) => frame.header.sequence, 'sequence', 9)
               .having((frame) => frame.opusPayload, 'Opus', [0xaa]),
         ),
       );
       channel.emitBinary(
-        Uint8List.fromList([4, 0, 9, 0, 0, 3, 0xc0, 0xd8, 0, 0xaa]),
+        Uint8List.fromList([4, 0, 0, 9, 0, 0, 3, 0xc0, 0xd8, 0, 0xaa]),
       );
       await inbound;
 
@@ -435,6 +436,58 @@ void main() {
   );
 
   test(
+    'stale-epoch frame is fenced after its index is reused by a new occupant',
+    () async {
+      // Blocker 1 causal race: a frame authored by the prior occupant of an
+      // index can be queued in the relay's data path and delivered *after* the
+      // roster control that reassigns the index. Index-only fencing would
+      // mis-attribute it to the new occupant; the epoch rejects it.
+      final channel = _ControlledWebSocketChannel();
+      final transport = _transport(channel);
+      addTearDown(transport.dispose);
+      await _connect(
+        channel,
+        transport,
+        revision: 1,
+        peers: const [
+          {'pubkey': 'old', 'peer_index': 4, 'epoch': 0},
+        ],
+      );
+      final received = <int>[];
+      final subscription = transport.remoteAudioFrames.listen(
+        (frame) => received.add(frame.header.sequence),
+      );
+      addTearDown(subscription.cancel);
+
+      // 'old' (epoch 0) leaves and 'new' reuses index 4 at epoch 1.
+      channel.emitText(
+        jsonEncode({
+          'type': 'joined',
+          'revision': 2,
+          'pubkey': 'new',
+          'peer_index': 4,
+          'epoch': 1,
+          'peers': [
+            {'pubkey': 'new', 'peer_index': 4, 'epoch': 1},
+          ],
+        }),
+      );
+      await _waitForRevision(transport, 2);
+      expect(transport.state.peers[4]?.pubkey, 'new');
+      expect(transport.state.peers[4]?.epoch, 1);
+
+      // A residual frame from 'old' (epoch 0) arrives after the reassignment.
+      // It must be dropped, not delivered as 'new' audio.
+      channel.emitBinary(_relayFrame(peerIndex: 4, epoch: 0, sequence: 7));
+      // A legitimate 'new' frame (epoch 1) is delivered.
+      channel.emitBinary(_relayFrame(peerIndex: 4, epoch: 1, sequence: 8));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(received, [8]);
+    },
+  );
+
+  test(
     're-admission reports departed and reused peer indexes before new media',
     () async {
       final firstChannel = _ControlledWebSocketChannel();
@@ -608,7 +661,11 @@ Future<void> _connect(
   await connect;
 }
 
-Uint8List _relayFrame({required int peerIndex, required int sequence}) {
+Uint8List _relayFrame({
+  required int peerIndex,
+  required int sequence,
+  int epoch = 0,
+}) {
   final header = HuddleAudioHeader(
     sequence: sequence,
     timestamp48k: sequence * 960,
@@ -619,7 +676,7 @@ Uint8List _relayFrame({required int peerIndex, required int sequence}) {
     header,
     Uint8List.fromList([sequence & 0xff]),
   );
-  return Uint8List.fromList([peerIndex, ...clientFrame]);
+  return Uint8List.fromList([peerIndex, epoch, ...clientFrame]);
 }
 
 Future<void> _waitForPhase(

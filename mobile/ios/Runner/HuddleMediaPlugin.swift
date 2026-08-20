@@ -1,5 +1,6 @@
 import AVFoundation
 import Flutter
+import UIKit
 
 /// Foreground-only native seam for iOS Huddle media.
 ///
@@ -66,6 +67,8 @@ final class HuddleMediaPlugin {
       result(capabilities)
     case "requestMicrophonePermission":
       requestMicrophonePermission(result: result)
+    case "openSystemSettings":
+      openSystemSettings(result: result)
     case "prepare":
       prepare(arguments: call.arguments, result: result)
     case "start":
@@ -112,6 +115,25 @@ final class HuddleMediaPlugin {
       }
     @unknown default:
       result("restricted")
+    }
+  }
+
+  /// Open the iOS Settings app on this app's page so the user can grant a
+  /// previously denied microphone permission. iOS never re-prompts once denied,
+  /// so this is the only in-app recovery path.
+  private func openSystemSettings(result: @escaping FlutterResult) {
+    guard let url = URL(string: UIApplication.openSettingsURLString) else {
+      result(false)
+      return
+    }
+    DispatchQueue.main.async {
+      guard UIApplication.shared.canOpenURL(url) else {
+        result(false)
+        return
+      }
+      UIApplication.shared.open(url, options: [:]) { opened in
+        result(opened)
+      }
     }
   }
 

@@ -4195,6 +4195,58 @@ void main() {
       },
     );
 
+    testWidgets(
+      'offers a Settings recovery path instead of a blind retry after a '
+      'microphone denial',
+      (tester) async {
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final media = _HuddleTestMedia(
+          permission: HuddleMicrophonePermission.denied,
+        );
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _huddleMsg(
+                id: 'mic-denied-huddle',
+                kind: EventKind.huddleStarted,
+                pubkey: 'desktop',
+                createdAt: now,
+              ),
+            ],
+            users: const {
+              'desktop': UserProfile(pubkey: 'desktop'),
+              'self': UserProfile(pubkey: 'self'),
+            },
+            relayConfigNotifier: _HuddleRelayConfigNotifier(),
+            huddleCurrentPubkey: 'self',
+            huddleMediaFactory: () => media,
+            huddleTransportFactory: (_) => _HuddleTestTransport(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.widgetWithText(FilledButton, 'Join'));
+        await tester.pumpAndSettle();
+
+        // A denied microphone must NOT surface the generic "Try again" that
+        // deterministically fails again — only the Settings recovery path.
+        expect(find.byTooltip('Try again'), findsNothing);
+        expect(find.byTooltip('Open Settings'), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byKey(const ValueKey('huddle-retry')),
+            matching: find.byIcon(LucideIcons.settings),
+          ),
+          findsOneWidget,
+        );
+
+        await tester.tap(find.byKey(const ValueKey('huddle-retry')));
+        await tester.pumpAndSettle();
+
+        expect(media.openSettingsCalls, 1);
+      },
+    );
+
     testWidgets('does not leave a stale Huddle card in a retry loop', (
       tester,
     ) async {
@@ -4352,9 +4404,9 @@ void main() {
         final media = _HuddleTestMedia();
         final transport = _HuddleTestTransport(
           peers: const {
-            1: HuddlePeer(pubkey: 'desktop', peerIndex: 1),
-            2: HuddlePeer(pubkey: 'self', peerIndex: 2),
-            3: HuddlePeer(pubkey: 'agent', peerIndex: 3),
+            1: HuddlePeer(pubkey: 'desktop', peerIndex: 1, epoch: 0),
+            2: HuddlePeer(pubkey: 'self', peerIndex: 2, epoch: 0),
+            3: HuddlePeer(pubkey: 'agent', peerIndex: 3, epoch: 0),
           },
         );
         final navigator = _RecordingNavigatorObserver();
@@ -4898,11 +4950,12 @@ void main() {
         final remotePubkeys = List.generate(24, (index) => 'guest-$index');
         final transport = _HuddleTestTransport(
           peers: {
-            0: const HuddlePeer(pubkey: 'self', peerIndex: 0),
+            0: const HuddlePeer(pubkey: 'self', peerIndex: 0, epoch: 0),
             for (var index = 0; index < remotePubkeys.length; index++)
               index + 1: HuddlePeer(
                 pubkey: remotePubkeys[index],
                 peerIndex: index + 1,
+                epoch: 0,
               ),
           },
         );
@@ -5048,7 +5101,7 @@ void main() {
         const guestPubkey = 'guest';
         final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
         final transport = _HuddleTestTransport(
-          peers: const {2: HuddlePeer(pubkey: 'self', peerIndex: 2)},
+          peers: const {2: HuddlePeer(pubkey: 'self', peerIndex: 2, epoch: 0)},
         );
 
         await tester.pumpWidget(
@@ -5087,7 +5140,7 @@ void main() {
         expect(soloCenter, closeTo(tester.getCenter(stage).dy, 1));
 
         transport.emitPeerJoin(
-          const HuddlePeer(pubkey: guestPubkey, peerIndex: 1),
+          const HuddlePeer(pubkey: guestPubkey, peerIndex: 1, epoch: 0),
         );
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 130));
@@ -11058,9 +11111,13 @@ class _HuddleRelayConfigNotifier extends RelayConfigNotifier {
 }
 
 final class _HuddleTestMedia implements HuddleMedia {
-  _HuddleTestMedia({this.stopGate});
+  _HuddleTestMedia({
+    this.stopGate,
+    this.permission = HuddleMicrophonePermission.granted,
+  });
 
   final Future<void>? stopGate;
+  final HuddleMicrophonePermission permission;
   final stopStarted = Completer<void>();
   final _states = StreamController<HuddleMediaState>.broadcast(sync: true);
   final _localFrames = StreamController<HuddleLocalAudioFrame>.broadcast(
@@ -11099,7 +11156,15 @@ final class _HuddleTestMedia implements HuddleMedia {
 
   @override
   Future<HuddleMicrophonePermission> requestMicrophonePermission() async =>
-      HuddleMicrophonePermission.granted;
+      permission;
+
+  var openSettingsCalls = 0;
+
+  @override
+  Future<bool> openSystemSettings() async {
+    openSettingsCalls += 1;
+    return true;
+  }
 
   @override
   Future<void> prepare() async {
@@ -11194,8 +11259,8 @@ final class _HuddleTestTransport implements HuddleTransportClient {
     this.connectError,
     this.connectGate,
     Map<int, HuddlePeer> peers = const {
-      1: HuddlePeer(pubkey: 'desktop', peerIndex: 1),
-      2: HuddlePeer(pubkey: 'self', peerIndex: 2),
+      1: HuddlePeer(pubkey: 'desktop', peerIndex: 1, epoch: 0),
+      2: HuddlePeer(pubkey: 'self', peerIndex: 2, epoch: 0),
     },
   }) : _peers = Map<int, HuddlePeer>.from(peers);
 
@@ -11227,6 +11292,7 @@ final class _HuddleTestTransport implements HuddleTransportClient {
     _remoteFrames.add(
       HuddleRemoteAudioFrame(
         peerIndex: 1,
+        epoch: 0,
         header: HuddleAudioHeader(
           sequence: sequence,
           timestamp48k: 960,

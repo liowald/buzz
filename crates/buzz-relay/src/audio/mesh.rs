@@ -23,12 +23,14 @@
 //!
 //! The client sends `[8B v2 header][opaque Opus]`; the relay parses the header
 //! for telemetry only and forwards the frame opaquely, and `broadcast_frame`
-//! prepends a 1-byte `peer_index`. That `peer_index` is relay-added *routing*
-//! metadata — it never touches ciphertext — so the whole byte string
-//! `[peer_index][v2 header][Opus]` is exactly what [`MeshDatagram::payload`] is
-//! for: opaque to encryption, owned by the routing plane. **peer_index is
-//! always the first byte of a media datagram payload, both directions.** The
-//! client's WebSocket wire format is byte-identical to a single-pod huddle.
+//! prepends a 2-byte `[peer_index][epoch]` routing prefix. That prefix is
+//! relay-added *routing* metadata — it never touches ciphertext — so the whole
+//! byte string `[peer_index][epoch][v2 header][Opus]` is exactly what
+//! [`MeshDatagram::payload`] is for: opaque to encryption, owned by the routing
+//! plane. **peer_index is always the first byte of a media datagram payload,
+//! both directions**, and the `epoch` that follows it rides opaquely through
+//! the split-and-reprefix below. The client's WebSocket wire format is
+//! byte-identical to a single-pod huddle.
 //!
 //! ## Room stays pure
 //!
@@ -199,9 +201,9 @@ impl MeshAudioRouter {
 
     /// Deliver an inbound media datagram to the addressed local huddle.
     ///
-    /// The payload is `[peer_index][v2 header][Opus]` — already prefixed by the
-    /// sender (the owner, when fanning out to us; or a non-owner client's pod,
-    /// when we are the owner). We fence, then push the payload into every
+    /// The payload is `[peer_index][epoch][v2 header][Opus]` — already prefixed
+    /// by the sender (the owner, when fanning out to us; or a non-owner client's
+    /// pod, when we are the owner). We fence, then push the payload into every
     /// *local* peer's audio sink **except** the peer whose index authored it,
     /// mirroring `broadcast_frame`'s "everyone but the sender" rule so a speaker
     /// never hears themselves.
@@ -236,9 +238,11 @@ impl MeshAudioRouter {
             return verdict;
         };
         // Reconstruct the exact on-wire frame the local fan-out uses:
-        // [peer_index][v2 header][Opus]. `rest` is [v2 header][Opus]; the
-        // prefix is the author's index. We hand peers the already-prefixed
-        // bytes and skip re-broadcasting to the author's own index.
+        // [peer_index][epoch][v2 header][Opus]. `rest` is [epoch][v2 header]
+        // [Opus] — the epoch rides opaquely; only `peer_index` (the author's
+        // routing index) is split off for the skip-self check. We hand peers
+        // the already-prefixed bytes and skip re-broadcasting to the author's
+        // own index.
         let mut prefixed = bytes::BytesMut::with_capacity(dgram.payload.len());
         prefixed.extend_from_slice(&[author_index]);
         prefixed.extend_from_slice(rest);

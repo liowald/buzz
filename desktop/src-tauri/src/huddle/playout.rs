@@ -114,6 +114,20 @@ fn is_agent_peer(
     })
 }
 
+/// Whether `peer_idx` is currently occupied at exactly `epoch`, per the
+/// authoritative roster. A frame is deliverable only when both match: an index
+/// absent from the roster is stale, and a slot reused by a later occupant has
+/// advanced its epoch, so a departed occupant's in-flight frame is fenced
+/// rather than mis-attributed to the new occupant. A legacy relay omits the
+/// epoch, which degrades to `0` on both sides, making the fence a no-op.
+fn is_current_occupant(
+    peer_idx: u8,
+    epoch: u8,
+    index_to_epoch: &std::collections::HashMap<u8, u8>,
+) -> bool {
+    index_to_epoch.get(&peer_idx) == Some(&epoch)
+}
+
 fn mix_remote_stt_samples(mix: &mut Vec<f32>, samples: &[f32]) {
     if mix.len() < samples.len() {
         mix.resize(samples.len(), 0.0);
@@ -134,8 +148,8 @@ fn f32_samples_to_le_bytes(samples: &[f32]) -> Vec<u8> {
 /// One remote peer's slot: jitter buffer + dedicated rodio Player.
 ///
 /// Per-frame seq/timestamp come from the v2 wire header (sender-authored).
-/// The relay forwards `peer_index | header | opus_bytes` opaquely; we parse
-/// the header here and pass the sender's own monotonic seq + 48 kHz media
+/// The relay forwards `peer_index | epoch | header | opus_bytes` opaquely; we
+/// parse the header here and pass the sender's own monotonic seq + 48 kHz media
 /// timestamp into NetEq.
 struct PeerSlot {
     jitter: PeerJitterBuffer,
@@ -207,7 +221,7 @@ pub(crate) async fn run_playout_recv_loop(
     sink_handle: rodio::MixerDeviceSink,
     cancel: CancellationToken,
     app_handle: Option<tauri::AppHandle>,
-    initial_peers: Vec<(u8, String)>,
+    initial_peers: Vec<(u8, String, u8)>,
     tts_active: Arc<AtomicBool>,
     tts_cancel: Arc<AtomicBool>,
     local_tts_publishers: super::tts::LocalTtsPublishers,
@@ -222,7 +236,16 @@ pub(crate) async fn run_playout_recv_loop(
     let rate = NonZero::new(SAMPLE_RATE_HZ).expect("48k is non-zero");
 
     let mut index_to_pubkey: std::collections::HashMap<u8, String> =
-        initial_peers.into_iter().collect();
+        std::collections::HashMap::new();
+    // Occupancy epoch per index, mirroring the authoritative roster. Advances
+    // each time a slot is reused by a new occupant, so a frame authored by a
+    // departed occupant that arrives after its index is reassigned carries the
+    // old epoch and is fenced rather than mis-attributed to the new occupant.
+    let mut index_to_epoch: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
+    for (idx, pubkey, epoch) in initial_peers {
+        index_to_pubkey.insert(idx, pubkey);
+        index_to_epoch.insert(idx, epoch);
+    }
     let mut active_indices: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let mut speaker_levels: std::collections::HashMap<u8, f32> = std::collections::HashMap::new();
     let mut frame_counts: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
@@ -342,19 +365,31 @@ pub(crate) async fn run_playout_recv_loop(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(WsMsg::Binary(data))) => {
-                        // Wire shape (v2): [peer_index: u8][header: 8 bytes][opus payload...]
-                        // The minimum size is 1 (peer_index) + 8 (header) + ≥1 Opus byte.
-                        if data.len() <= 1 + V2_HEADER_LEN {
+                        // Wire shape (v2): [peer_index: u8][epoch: u8][header: 8 bytes][opus payload...]
+                        // The minimum size is 2 (peer_index + epoch) + 8 (header) + ≥1 Opus byte.
+                        if data.len() <= 2 + V2_HEADER_LEN {
                             continue;
                         }
                         let peer_idx = data[0];
+                        let epoch = data[1];
+                        // Fence the peer-index reuse race: a frame authored by a
+                        // departed occupant that arrives after its index is
+                        // reassigned carries the old epoch. Drop it rather than
+                        // mis-attribute stale audio (and the new occupant's
+                        // human/agent STT policy) to whoever grabbed the index.
+                        // An index absent from the roster is also stale. A slot
+                        // with no known epoch (legacy relay) degrades to 0 on
+                        // both sides, so the fence is a no-op there.
+                        if !is_current_occupant(peer_idx, epoch, &index_to_epoch) {
+                            continue;
+                        }
                         // Suppress only an agent stream synthesized and
                         // published by this desktop. Other bot-role peers may
                         // publish their own legitimate audio and must play.
                         if is_locally_synthesized_peer(peer_idx, &local_tts_publishers) {
                             continue;
                         }
-                        let after_idx = &data[1..];
+                        let after_idx = &data[2..];
                         let Some((header, opus_bytes)) = FrameHeader::parse(after_idx)
                         else {
                             // Malformed v2 frame: header parse only fails when
@@ -446,6 +481,10 @@ pub(crate) async fn run_playout_recv_loop(
                                                 p["peer_index"].as_u64(),
                                             ) {
                                                 let key = idx as u8;
+                                                // Absent `epoch` (legacy relay) degrades to
+                                                // 0 so the fence stays a no-op.
+                                                let epoch =
+                                                    p["epoch"].as_u64().unwrap_or(0) as u8;
                                                 // peer_index reuse with a new pubkey:
                                                 // flush the old peer's NetEq + Player so
                                                 // the next frame starts clean.
@@ -460,6 +499,7 @@ pub(crate) async fn run_playout_recv_loop(
                                                     speaker_levels.remove(&key);
                                                 }
                                                 index_to_pubkey.insert(key, pk.to_string());
+                                                index_to_epoch.insert(key, epoch);
                                             }
                                         }
                                     }
@@ -467,12 +507,18 @@ pub(crate) async fn run_playout_recv_loop(
                                 Some("roster") => {
                                     if let Some(peer_list) = v["peers"].as_array() {
                                         let mut replacement = std::collections::HashMap::new();
+                                        let mut replacement_epochs =
+                                            std::collections::HashMap::new();
                                         for p in peer_list {
                                             if let (Some(pk), Some(idx)) = (
                                                 p["pubkey"].as_str(),
                                                 p["peer_index"].as_u64(),
                                             ) {
-                                                replacement.insert(idx as u8, pk.to_string());
+                                                let key = idx as u8;
+                                                let epoch =
+                                                    p["epoch"].as_u64().unwrap_or(0) as u8;
+                                                replacement.insert(key, pk.to_string());
+                                                replacement_epochs.insert(key, epoch);
                                             }
                                         }
                                         let identity_unchanged = |idx: &u8| {
@@ -483,12 +529,14 @@ pub(crate) async fn run_playout_recv_loop(
                                         active_indices.retain(identity_unchanged);
                                         speaker_levels.retain(|idx, _| identity_unchanged(idx));
                                         index_to_pubkey = replacement;
+                                        index_to_epoch = replacement_epochs;
                                     }
                                 }
                                 Some("left") => {
                                     if let Some(idx) = v["peer_index"].as_u64() {
                                         let key = idx as u8;
                                         index_to_pubkey.remove(&key);
+                                        index_to_epoch.remove(&key);
                                         frame_counts.remove(&key);
                                         active_indices.remove(&key);
                                         speaker_levels.remove(&key);
@@ -568,6 +616,38 @@ mod tests {
         assert!(!is_agent_peer(3, &peers, &agents));
         assert!(is_agent_peer(4, &peers, &agents));
         assert!(!is_agent_peer(9, &peers, &agents));
+    }
+
+    /// Causal regression for the peer-index reuse race (Jude's blocking
+    /// finding): a frame authored by a departed occupant that arrives after
+    /// its slot is reassigned to a new occupant carries the stale epoch and
+    /// must be fenced, never mis-attributed to the new occupant.
+    #[test]
+    fn stale_epoch_frame_is_fenced_after_its_index_is_reused() {
+        let mut index_to_epoch = std::collections::HashMap::new();
+        // Slot 3 first occupied at epoch 0.
+        index_to_epoch.insert(3_u8, 0_u8);
+        assert!(
+            is_current_occupant(3, 0, &index_to_epoch),
+            "current occupant's frame is delivered"
+        );
+
+        // The occupant departs and a new peer reuses slot 3 at epoch 1.
+        index_to_epoch.insert(3, 1);
+        assert!(
+            !is_current_occupant(3, 0, &index_to_epoch),
+            "in-flight frame from the departed occupant (epoch 0) is fenced"
+        );
+        assert!(
+            is_current_occupant(3, 1, &index_to_epoch),
+            "the new occupant's frame (epoch 1) is delivered"
+        );
+
+        // A frame for an index absent from the roster is stale.
+        assert!(
+            !is_current_occupant(9, 0, &index_to_epoch),
+            "frame for an unoccupied index is dropped"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ abstract final class HuddleWireV2 {
   static const frameSamples = 960;
   static const frameDuration = Duration(milliseconds: 20);
   static const headerLength = 8;
-  static const relayPeerPrefixLength = 1;
+  static const relayPeerPrefixLength = 2;
   static const dtxFlag = 0x01;
   static const maxBinaryFrameLength = 4096;
 
@@ -35,7 +35,8 @@ abstract final class HuddleWireV2 {
     return Uint8List.fromList([...header.encode(), ...opusPayload]);
   }
 
-  /// Decodes a relay-to-client frame: `peer index | header | opus payload`.
+  /// Decodes a relay-to-client frame:
+  /// `peer index | epoch | header | opus payload`.
   static HuddleRemoteAudioFrame decodeRelayFrame(Uint8List bytes) {
     final minimumLength = relayPeerPrefixLength + headerLength + 1;
     if (bytes.length < minimumLength) {
@@ -53,6 +54,7 @@ abstract final class HuddleWireV2 {
 
     return HuddleRemoteAudioFrame(
       peerIndex: bytes[0],
+      epoch: bytes[1],
       header: HuddleAudioHeader.decode(bytes, offset: relayPeerPrefixLength),
       opusPayload: Uint8List.fromList(
         bytes.sublist(relayPeerPrefixLength + headerLength),
@@ -163,11 +165,18 @@ final class HuddleAudioHeader {
 @immutable
 final class HuddleRemoteAudioFrame {
   final int peerIndex;
+
+  /// Occupancy epoch of `peerIndex` this frame was authored under. Fenced by
+  /// the transport against the current roster occupant's epoch so a frame from
+  /// a departed occupant that arrives after its slot is reused is dropped
+  /// rather than mis-attributed to the new occupant.
+  final int epoch;
   final HuddleAudioHeader header;
   final Uint8List opusPayload;
 
   const HuddleRemoteAudioFrame({
     required this.peerIndex,
+    required this.epoch,
     required this.header,
     required this.opusPayload,
   });

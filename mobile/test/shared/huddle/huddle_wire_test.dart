@@ -32,6 +32,7 @@ void main() {
       final frame = HuddleWireV2.decodeRelayFrame(
         Uint8List.fromList([
           0x07,
+          0x00,
           0x12,
           0x34,
           0x01,
@@ -46,6 +47,7 @@ void main() {
       );
 
       expect(frame.peerIndex, 7);
+      expect(frame.epoch, 0);
       expect(frame.header.sequence, 0x1234);
       expect(frame.header.timestamp48k, 0x01020304);
       expect(frame.header.levelDbov, -42);

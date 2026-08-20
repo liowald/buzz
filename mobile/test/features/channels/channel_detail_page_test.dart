@@ -55,6 +55,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 const _channelId = '11111111-2222-4333-8444-555555555555';
 const _huddleChannelId = '8d764100-fd8f-44cf-9c98-6d8fbd739b8c';
+const _otherChannelId = '22222222-3333-4444-8555-666666666666';
+const _otherHuddleChannelId = '9e875211-ae90-45df-8da9-7e9ace84ca9d';
 
 final _mutableHuddleMembersProvider =
     NotifierProvider<_MutableHuddleMembersNotifier, List<ChannelMember>>(
@@ -5608,6 +5610,154 @@ void main() {
         await transition;
 
         expect(leftChannelId, _huddleChannelId);
+      },
+    );
+
+    testWidgets(
+      'last-human leave superseded during count by another Huddle archives the old room',
+      (tester) async {
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final humanCount = Completer<int>();
+        final media = Queue<_HuddleTestMedia>.of([
+          _HuddleTestMedia(),
+          _HuddleTestMedia(),
+        ]);
+        final transports = Queue<_HuddleTestTransport>.of([
+          _HuddleTestTransport(),
+          _HuddleTestTransport(),
+        ]);
+        final relaySession = _ReconnectingRelaySession();
+        String? archivedChannelId;
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _huddleMsg(
+                id: 'different-huddle-during-count',
+                kind: EventKind.huddleStarted,
+                pubkey: 'self',
+                createdAt: now,
+              ),
+            ],
+            users: const {'self': UserProfile(pubkey: 'self')},
+            relayConfigNotifier: _HuddleRelayConfigNotifier(),
+            relaySessionNotifier: relaySession,
+            huddleCurrentPubkey: 'self',
+            huddleHumanCountLoader: (_) => humanCount.future,
+            huddleMediaFactory: media.removeFirst,
+            huddleTransportFactory: (_) => transports.removeFirst(),
+            createChannelActions: (ref) => _FakeChannelActions(
+              ref,
+              onArchiveChannel: (channelId) async =>
+                  archivedChannelId = channelId,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'Join'));
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MobileHuddleShell)),
+        );
+        final controller = container.read(
+          mobileHuddleControllerProvider.notifier,
+        );
+        final staleLeave = controller.leave();
+        await tester.pump();
+        await controller.join(
+          parentChannelId: _otherChannelId,
+          ephemeralChannelId: _otherHuddleChannelId,
+          startedBy: 'self',
+          startedEventId: 'different-huddle-start',
+        );
+        humanCount.complete(1);
+        await staleLeave;
+        await tester.pump();
+
+        expect(relaySession.publishedKinds, contains(EventKind.huddleEnded));
+        expect(archivedChannelId, _huddleChannelId);
+        expect(
+          container.read(huddleSessionProvider).ephemeralChannelId,
+          _otherHuddleChannelId,
+        );
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(milliseconds: 100));
+      },
+    );
+
+    testWidgets(
+      'last-human leave superseded during end publish by another Huddle archives the old room',
+      (tester) async {
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final endPublishGate = Completer<void>();
+        final media = Queue<_HuddleTestMedia>.of([
+          _HuddleTestMedia(),
+          _HuddleTestMedia(),
+        ]);
+        final transports = Queue<_HuddleTestTransport>.of([
+          _HuddleTestTransport(),
+          _HuddleTestTransport(),
+        ]);
+        final relaySession = _ReconnectingRelaySession(
+          huddleEndPublishGate: endPublishGate.future,
+        );
+        String? archivedChannelId;
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _huddleMsg(
+                id: 'different-huddle-during-end',
+                kind: EventKind.huddleStarted,
+                pubkey: 'self',
+                createdAt: now,
+              ),
+            ],
+            users: const {'self': UserProfile(pubkey: 'self')},
+            relayConfigNotifier: _HuddleRelayConfigNotifier(),
+            relaySessionNotifier: relaySession,
+            huddleCurrentPubkey: 'self',
+            huddleHumanCountLoader: (_) async => 1,
+            huddleMediaFactory: media.removeFirst,
+            huddleTransportFactory: (_) => transports.removeFirst(),
+            createChannelActions: (ref) => _FakeChannelActions(
+              ref,
+              onArchiveChannel: (channelId) async =>
+                  archivedChannelId = channelId,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'Join'));
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MobileHuddleShell)),
+        );
+        final controller = container.read(
+          mobileHuddleControllerProvider.notifier,
+        );
+        final staleLeave = controller.leave();
+        await relaySession.huddleEndPublishStarted.future;
+        await controller.join(
+          parentChannelId: _otherChannelId,
+          ephemeralChannelId: _otherHuddleChannelId,
+          startedBy: 'self',
+          startedEventId: 'different-huddle-start',
+        );
+        endPublishGate.complete();
+        await staleLeave;
+        await tester.pump();
+
+        expect(relaySession.publishedKinds, contains(EventKind.huddleEnded));
+        expect(archivedChannelId, _huddleChannelId);
+        expect(
+          container.read(huddleSessionProvider).ephemeralChannelId,
+          _otherHuddleChannelId,
+        );
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(milliseconds: 100));
       },
     );
 

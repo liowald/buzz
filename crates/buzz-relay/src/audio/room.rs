@@ -46,7 +46,7 @@ const CTRL_CHANNEL_CAPACITY: usize = 32;
 
 /// Defense-in-depth cap on peers per room. A room with N peers generates
 /// N×(N−1) frame copies per 20ms tick — 25 peers = 600 copies/tick, which
-/// is reasonable. The 255 index space is the hard limit; this is the soft one.
+/// is reasonable. Routing identities rotate through a larger 255-value pool.
 const MAX_PEERS_PER_ROOM: usize = 25;
 
 /// One authoritative owner-roster entry.
@@ -94,7 +94,8 @@ pub type PeerAdmission = (
 pub enum AdmissionError {
     /// The room has been ended (or is shutting down) and no longer admits peers.
     Ended,
-    /// The room has hit the soft peer cap or exhausted the 255-index space.
+    /// The room has hit its participant cap or the requested routing identity
+    /// is already active.
     Full,
     /// The room is pinned to a different protocol version than the requested one.
     /// The caller should reply to the WS client with an `upgrade_required` error
@@ -115,14 +116,14 @@ pub enum AdmissionError {
 /// exclusive with peer admission. This closes the race between the last
 /// peer's cleanup path and a concurrent joiner.
 struct AdmissionGuard {
-    /// First index never assigned in this room generation. Indices below this
-    /// high-water mark are retired even after disconnect so a delayed local
-    /// publisher cleanup can never alias a newly admitted remote stream.
-    next_fresh: u8,
-    /// Every owner-assigned index admitted by this room generation, including
-    /// departed peers. Non-owner ingress must reject stale owner assignments
-    /// rather than reintroducing a retired identity.
-    used_indices: HashSet<u8>,
+    /// Next routing identity to probe. Allocation rotates through the complete
+    /// 0..=254 space so a recently departed identity is not immediately reused,
+    /// while long-running rooms never consume a finite lifetime admission
+    /// budget.
+    next_candidate: u8,
+    /// Routing identities held by currently connected peers. Owner-assigned
+    /// mesh identities share this set with locally allocated identities.
+    active_indices: HashSet<u8>,
     ended: bool,
     /// Pinned huddle audio protocol version for this room.
     ///
@@ -149,8 +150,8 @@ struct AdmissionGuard {
 impl AdmissionGuard {
     fn new() -> Self {
         Self {
-            next_fresh: 0,
-            used_indices: HashSet::new(),
+            next_candidate: 0,
+            active_indices: HashSet::new(),
             ended: false,
             pinned_version: None,
             roster_revision: 0,
@@ -158,13 +159,14 @@ impl AdmissionGuard {
     }
 
     fn alloc(&mut self) -> Option<u8> {
-        if self.next_fresh == 255 {
-            return None;
+        for _ in 0..255 {
+            let idx = self.next_candidate;
+            self.next_candidate = if idx == 254 { 0 } else { idx + 1 };
+            if self.active_indices.insert(idx) {
+                return Some(idx);
+            }
         }
-        let idx = self.next_fresh;
-        self.next_fresh += 1;
-        self.used_indices.insert(idx);
-        Some(idx)
+        None
     }
 }
 
@@ -300,7 +302,7 @@ impl Room {
         if g.ended {
             return Err(AdmissionError::Ended);
         }
-        if self.peers.len() >= MAX_PEERS_PER_ROOM || g.used_indices.contains(&peer_index) {
+        if self.peers.len() >= MAX_PEERS_PER_ROOM || g.active_indices.contains(&peer_index) {
             return Err(AdmissionError::Full);
         }
         if let Some(pinned) = g.pinned_version {
@@ -312,13 +314,10 @@ impl Room {
             }
         }
         g.pinned_version.get_or_insert(requested_version);
-        g.used_indices.insert(peer_index);
-        // Keep later local allocation above every owner-assigned index if
-        // ownership changes while this room is still winding down. Skipped
-        // lower indices stay retired until a fresh room resets the allocator.
-        if peer_index >= g.next_fresh {
-            g.next_fresh = peer_index.saturating_add(1);
-        }
+        g.active_indices.insert(peer_index);
+        // Continue local allocation after the newest owner-assigned identity.
+        // The cursor wraps, so a high mesh index cannot burn the lower space.
+        g.next_candidate = if peer_index == 254 { 0 } else { peer_index + 1 };
 
         let peer_id = Uuid::new_v4();
         let (audio_tx, audio_rx) = mpsc::channel(AUDIO_CHANNEL_CAPACITY);
@@ -344,14 +343,14 @@ impl Room {
         Ok((peer_id, audio_rx, ctrl_rx, revision))
     }
 
-    /// Remove a peer. Its routing index remains retired for this room
-    /// generation so delayed frames or cleanup cannot alias a new participant.
-    /// Returns the ordered roster delta when the peer existed.
+    /// Remove a peer and release its routing identity for a later allocator
+    /// rotation. Returns the ordered roster delta when the peer existed.
     pub fn remove_peer(&self, peer_id: Uuid) -> Option<RosterDelta> {
         let Ok(mut g) = self.guard.lock() else {
             return None;
         };
         let (_, peer) = self.peers.remove(&peer_id)?;
+        g.active_indices.remove(&peer.peer_index);
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let delta = RosterDelta {
             revision: g.roster_revision,
@@ -375,6 +374,7 @@ impl Room {
         let mut g = self.guard.lock().ok()?;
         let (_, peer) = self.peers.remove(&peer_id)?;
         let peer_index = peer.peer_index;
+        g.active_indices.remove(&peer_index);
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let delta = RosterDelta {
             revision: g.roster_revision,
@@ -596,18 +596,31 @@ mod tests {
     }
 
     #[test]
-    fn departed_owner_assigned_index_cannot_be_readmitted() {
+    fn active_owner_assigned_index_cannot_be_readmitted() {
         let room = fresh_room();
-        let (remote_id, _audio, _ctrl, _revision) = room
+        let (_remote_id, _audio, _ctrl, _revision) = room
             .add_peer_at_index("remote".into(), 2, 7)
             .expect("owner-assigned index admits");
-        room.remove_peer(remote_id).expect("remote peer leaves");
 
         let result = room.add_peer_at_index("replacement".into(), 2, 7);
         assert!(
             matches!(result, Err(AdmissionError::Full)),
-            "retired owner-assigned index must not identify a new socket"
+            "an active owner-assigned index must not identify another socket"
         );
+    }
+
+    #[test]
+    fn owner_assigned_high_index_does_not_exhaust_local_allocation() {
+        let room = fresh_room();
+        let (remote_id, _audio, _ctrl, _revision) = room
+            .add_peer_at_index("remote".into(), 2, 254)
+            .expect("high owner-assigned index admits");
+        room.remove_peer(remote_id).expect("remote peer leaves");
+
+        let (_local_id, local_index, ..) = room
+            .add_peer("local".into(), 2)
+            .expect("a high owner index must not burn lower routing identities");
+        assert_eq!(local_index, 0);
     }
 
     #[test]
@@ -759,9 +772,9 @@ mod tests {
         );
     }
 
-    /// Peer indices are admission identities, so a departed index stays retired
-    /// until the room is evicted. This prevents delayed frames or local cleanup
-    /// from mistaking a new participant for the old socket.
+    /// Peer indices rotate instead of being immediately reused, which gives
+    /// queued media and cleanup work time to drain without imposing a lifetime
+    /// admission budget on the room.
     #[test]
     fn peer_indices_are_not_reused_within_a_room_generation() {
         let room = fresh_room();
@@ -780,12 +793,27 @@ mod tests {
         assert_eq!(keeper_idx, 1);
         assert_eq!(
             bob_idx, 2,
-            "a departed peer index must remain retired while the room lives",
+            "a departed peer index must not be immediately reused",
         );
     }
 
-    /// Protocol version pinning also persists across peer churn even though a
-    /// departed peer's routing index is retired.
+    #[test]
+    fn one_seated_peer_survives_more_than_index_space_reconnects() {
+        let room = fresh_room();
+        let (_keeper_id, keeper_index, ..) =
+            room.add_peer("keeper".into(), 2).expect("keeper admits");
+
+        for cycle in 0..300 {
+            let (peer_id, peer_index, ..) = room
+                .add_peer(format!("reconnect-{cycle}"), 2)
+                .unwrap_or_else(|error| panic!("cycle {cycle} must admit: {error:?}"));
+            assert_ne!(peer_index, keeper_index);
+            room.remove_peer(peer_id).expect("reconnecting peer leaves");
+        }
+    }
+
+    /// Protocol version pinning persists across peer churn even while routing
+    /// identities rotate for later reuse.
     #[test]
     fn version_pin_persists_across_peer_churn() {
         let room = fresh_room();

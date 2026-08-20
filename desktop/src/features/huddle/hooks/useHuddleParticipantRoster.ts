@@ -17,6 +17,7 @@ type ParticipantRosterOptions = {
   preservedParticipants?: readonly (string | null | undefined)[];
   relaySelfPubkey?: string | null;
   huddleThreadEventId?: string | null;
+  canonicalStartEvent?: RelayEvent | null;
 };
 
 function normalizedPubkey(value: string | null | undefined): string | null {
@@ -123,12 +124,19 @@ function authenticatedLifecycleEvents({
   events,
   relaySelfPubkey,
   huddleThreadEventId,
+  canonicalStartEvent,
 }: Pick<
   ParticipantRosterOptions,
-  "events" | "relaySelfPubkey" | "huddleThreadEventId"
+  "events" | "relaySelfPubkey" | "huddleThreadEventId" | "canonicalStartEvent"
 >): RelayEvent[] {
   const relaySelf = normalizedPubkey(relaySelfPubkey);
   const lifecycle = [...events];
+  if (
+    canonicalStartEvent &&
+    !lifecycle.some((event) => event.id === canonicalStartEvent.id)
+  ) {
+    lifecycle.push(canonicalStartEvent);
+  }
   const started = huddleThreadEventId
     ? (lifecycle.find(
         (event) =>
@@ -170,6 +178,7 @@ export function reconstructHuddleParticipantRoster({
   preservedParticipants = [],
   relaySelfPubkey = null,
   huddleThreadEventId = null,
+  canonicalStartEvent = null,
 }: ParticipantRosterOptions): string[] {
   const participants = new Set(
     fallbackParticipants
@@ -180,6 +189,7 @@ export function reconstructHuddleParticipantRoster({
     events,
     relaySelfPubkey,
     huddleThreadEventId,
+    canonicalStartEvent,
   })
     .filter((event) => lifecycleChannelId(event) === ephemeralChannelId)
     // Nostr timestamps have second precision and relay history arrives newest
@@ -187,12 +197,14 @@ export function reconstructHuddleParticipantRoster({
     // same-second join/leave mutations without relying on delivery order.
     .sort(compareLifecycleEvents);
   let ended = false;
+  const admissionIdsByParticipant = new Map<string, Set<string>>();
 
   for (const event of sorted) {
     switch (event.kind) {
       case KIND_HUDDLE_STARTED: {
         ended = false;
         participants.clear();
+        admissionIdsByParticipant.clear();
         const creator = normalizedPubkey(event.pubkey);
         if (creator) participants.add(creator);
         break;
@@ -200,18 +212,37 @@ export function reconstructHuddleParticipantRoster({
       case KIND_HUDDLE_PARTICIPANT_JOINED: {
         if (ended) break;
         const participant = lifecycleParticipant(event);
-        if (participant) participants.add(participant);
+        if (participant) {
+          const admissionId = lifecycleContent(event).admissionId;
+          if (admissionId) {
+            const admissionIds =
+              admissionIdsByParticipant.get(participant) ?? new Set<string>();
+            admissionIds.add(admissionId);
+            admissionIdsByParticipant.set(participant, admissionIds);
+          }
+          participants.add(participant);
+        }
         break;
       }
       case KIND_HUDDLE_PARTICIPANT_LEFT: {
         if (ended) break;
         const participant = lifecycleParticipant(event);
-        if (participant) participants.delete(participant);
+        if (participant) {
+          const admissionId = lifecycleContent(event).admissionId;
+          const admissionIds = admissionIdsByParticipant.get(participant);
+          if (admissionId && admissionIds) {
+            admissionIds.delete(admissionId);
+            if (admissionIds.size > 0) break;
+          }
+          admissionIdsByParticipant.delete(participant);
+          participants.delete(participant);
+        }
         break;
       }
       case KIND_HUDDLE_ENDED:
         ended = true;
         participants.clear();
+        admissionIdsByParticipant.clear();
         break;
     }
   }
@@ -287,11 +318,34 @@ export function useHuddleParticipantRoster({
         );
       });
 
+    if (huddleThreadEventId) {
+      void relayClient
+        .fetchEvents({
+          ids: [huddleThreadEventId],
+          kinds: [KIND_HUDDLE_STARTED],
+          limit: 1,
+        })
+        .then(([canonicalStart]) => {
+          if (!canonicalStart || disposed) return;
+          setLifecycle((current) => {
+            const events =
+              current?.sessionKey === sessionKey
+                ? new Map(current.events)
+                : new Map<string, RelayEvent>();
+            events.set(canonicalStart.id, canonicalStart);
+            return { sessionKey, events };
+          });
+        })
+        .catch((error) => {
+          console.error("[huddle] Canonical start lookup failed:", error);
+        });
+    }
+
     return () => {
       disposed = true;
       cleanup?.();
     };
-  }, [ephemeralChannelId, parentChannelId, sessionKey]);
+  }, [ephemeralChannelId, huddleThreadEventId, parentChannelId, sessionKey]);
 
   const events =
     lifecycle?.sessionKey === sessionKey ? lifecycle.events.values() : [];

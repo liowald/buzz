@@ -518,8 +518,8 @@ async fn handle_active_audio_connection(
     let (peer_id, peer_index, audio_rx, peer_ctrl_rx, admission_revision) = match admission {
         Ok(v) => v,
         Err(crate::audio::room::AdmissionError::Full) => {
-            warn!(channel_id = %channel_id, "audio room full (255 peers exhausted)");
-            let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"peer index space exhausted"}).to_string().into())).await;
+            warn!(channel_id = %channel_id, "audio room participant capacity reached");
+            let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())).await;
             if let (Some(session), Some(stream)) = (remote_session.as_ref(), remote_stream.as_mut())
             {
                 crate::audio::join::send_clean_close(stream, session.fenced(), session.pubkey())
@@ -977,7 +977,7 @@ fn remote_rejection_ws_error(reason: &crate::audio::join::RegisterRejection) -> 
     match reason {
         RegisterRejection::RoomFull => serde_json::json!({
             "type": "error", "code": "room_full",
-            "message": "peer index space exhausted"
+            "message": "room participant capacity reached"
         }),
         RegisterRejection::RoomEnded => serde_json::json!({
             "type": "error", "code": "room_ended", "message": "huddle has ended"

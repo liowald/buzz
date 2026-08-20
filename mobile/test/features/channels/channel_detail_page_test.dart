@@ -5614,6 +5614,69 @@ void main() {
     );
 
     testWidgets(
+      'background relay pause awaits failed-session lifecycle cleanup',
+      (tester) async {
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final media = _HuddleTestMedia();
+        final humanCount = Completer<int>();
+        final relaySession = _ReconnectingRelaySession();
+        String? leftChannelId;
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _huddleMsg(
+                id: 'failed-call-background',
+                kind: EventKind.huddleStarted,
+                pubkey: 'desktop',
+                createdAt: now,
+              ),
+            ],
+            users: const {
+              'desktop': UserProfile(pubkey: 'desktop'),
+              'self': UserProfile(pubkey: 'self'),
+            },
+            relayConfigNotifier: _HuddleRelayConfigNotifier(),
+            relaySessionNotifier: relaySession,
+            huddleCurrentPubkey: 'self',
+            huddleHumanCountLoader: (_) => humanCount.future,
+            huddleMediaFactory: () => media,
+            huddleTransportFactory: (_) => _HuddleTestTransport(),
+            createChannelActions: (ref) => _FakeChannelActions(
+              ref,
+              onLeaveChannel: (channelId) async => leftChannelId = channelId,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'Join'));
+        await tester.pumpAndSettle();
+
+        media.emitFailure();
+        await tester.pump();
+        relaySession.onAppPaused();
+        await tester.pump(const Duration(seconds: 5));
+        await tester.pump();
+
+        expect(relaySession.state.status, SessionStatus.reconnecting);
+        expect(leftChannelId, isNull);
+
+        humanCount.complete(2);
+        for (
+          var attempt = 0;
+          attempt < 20 &&
+              relaySession.state.status != SessionStatus.disconnected;
+          attempt++
+        ) {
+          await tester.pump();
+        }
+
+        expect(leftChannelId, _huddleChannelId);
+        expect(relaySession.state.status, SessionStatus.disconnected);
+      },
+    );
+
+    testWidgets(
       'last-human leave superseded during count by another Huddle archives the old room',
       (tester) async {
         final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;

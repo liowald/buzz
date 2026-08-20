@@ -74,6 +74,10 @@ fn map_huddle_backing_channel_error(error: buzz_db::DbError) -> IngestError {
     }
 }
 
+fn expected_huddle_backing_ttl(ephemeral_ttl_override: Option<i32>) -> i32 {
+    ephemeral_ttl_override.unwrap_or(3600)
+}
+
 async fn validate_huddle_lifecycle_event(
     tenant: &TenantContext,
     state: &AppState,
@@ -95,14 +99,15 @@ async fn validate_huddle_lifecycle_event(
     let signer_created_backing = backing.created_by.as_slice() == signer.as_slice();
 
     if kind == KIND_HUDDLE_STARTED {
+        let expected_ttl = expected_huddle_backing_ttl(state.config.ephemeral_ttl_override);
         if !signer_created_backing
             || backing.channel_type != "stream"
             || backing.visibility != "private"
-            || backing.ttl_seconds != Some(3600)
+            || backing.ttl_seconds != Some(expected_ttl)
             || backing.archived_at.is_some()
         {
             return Err(IngestError::Rejected(
-                "invalid: Huddle start must reference the signer's active private one-hour stream"
+                "invalid: Huddle start must reference the signer's active private ephemeral stream"
                     .into(),
             ));
         }
@@ -3171,6 +3176,12 @@ mod tests {
             map_huddle_backing_channel_error(buzz_db::DbError::Sqlx(error)),
             IngestError::Internal(message) if message.contains("loading Huddle backing channel")
         ));
+    }
+
+    #[test]
+    fn huddle_backing_ttl_honors_the_ephemeral_override() {
+        assert_eq!(expected_huddle_backing_ttl(None), 3600);
+        assert_eq!(expected_huddle_backing_ttl(Some(60)), 60);
     }
 
     #[test]

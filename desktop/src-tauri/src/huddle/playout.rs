@@ -102,6 +102,18 @@ fn is_locally_synthesized_peer(
         .contains_key(&peer_idx)
 }
 
+fn is_agent_peer(
+    peer_idx: u8,
+    index_to_pubkey: &std::collections::HashMap<u8, String>,
+    agent_pubkeys: &[String],
+) -> bool {
+    index_to_pubkey.get(&peer_idx).is_some_and(|pubkey| {
+        agent_pubkeys
+            .iter()
+            .any(|agent| agent.eq_ignore_ascii_case(pubkey))
+    })
+}
+
 fn mix_remote_stt_samples(mix: &mut Vec<f32>, samples: &[f32]) {
     if mix.len() < samples.len() {
         mix.resize(samples.len(), 0.0);
@@ -200,6 +212,7 @@ pub(crate) async fn run_playout_recv_loop(
     tts_cancel: Arc<AtomicBool>,
     local_tts_publishers: super::tts::LocalTtsPublishers,
     remote_stt_pipeline: Arc<std::sync::Mutex<Option<std::sync::Weak<super::stt::SttPipeline>>>>,
+    agent_pubkeys: Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     use rodio::buffer::SamplesBuffer;
     use std::num::NonZero;
@@ -267,7 +280,15 @@ pub(crate) async fn run_playout_recv_loop(
                                 slot.player.skip_one();
                             }
                             if !is_locally_synthesized_peer(*peer_idx, &local_tts_publishers) {
-                                mix_remote_stt_samples(&mut remote_stt_mix, &samples);
+                                let remote_agent = {
+                                    let agents = agent_pubkeys
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    is_agent_peer(*peer_idx, &index_to_pubkey, &agents)
+                                };
+                                if !remote_agent {
+                                    mix_remote_stt_samples(&mut remote_stt_mix, &samples);
+                                }
                             }
                             slot.player.append(SamplesBuffer::new(channels, rate, samples));
                         }
@@ -536,6 +557,17 @@ mod tests {
             "a second socket for the same agent remains audible"
         );
         assert!(!is_locally_synthesized_peer(9, &local_publishers));
+    }
+
+    #[test]
+    fn remote_agent_identity_is_excluded_from_human_stt() {
+        let peers =
+            std::collections::HashMap::from([(3, "human".to_owned()), (4, "AGENT".to_owned())]);
+        let agents = vec!["agent".to_owned()];
+
+        assert!(!is_agent_peer(3, &peers, &agents));
+        assert!(is_agent_peer(4, &peers, &agents));
+        assert!(!is_agent_peer(9, &peers, &agents));
     }
 
     #[test]

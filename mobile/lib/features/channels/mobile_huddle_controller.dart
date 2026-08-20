@@ -246,8 +246,39 @@ final class MobileHuddleController extends Notifier<bool> {
   Future<void>? _failureCleanup;
   final Set<Future<void>> _lifecycleCleanups = {};
 
-  Future<void> _leaveForBackground() =>
-      _backgroundLeave ??= leave().whenComplete(() => _backgroundLeave = null);
+  Future<void> _leaveForBackground() {
+    final inFlight = _backgroundLeave;
+    if (inFlight != null) return inFlight;
+
+    late final Future<void> backgroundLeave;
+    backgroundLeave = _finishBackgroundLeave().whenComplete(() {
+      if (identical(_backgroundLeave, backgroundLeave)) {
+        _backgroundLeave = null;
+      }
+    });
+    _backgroundLeave = backgroundLeave;
+    return backgroundLeave;
+  }
+
+  Future<void> _finishBackgroundLeave() async {
+    Object? leaveFailure;
+    StackTrace? leaveFailureStackTrace;
+    try {
+      await leave();
+    } catch (error, stackTrace) {
+      leaveFailure = error;
+      leaveFailureStackTrace = stackTrace;
+    }
+
+    final failureCleanup = _failureCleanup;
+    if (failureCleanup != null) await failureCleanup;
+    if (_lifecycleCleanups.isNotEmpty) {
+      await Future.wait(_lifecycleCleanups.toList());
+    }
+    if (leaveFailure != null) {
+      Error.throwWithStackTrace(leaveFailure, leaveFailureStackTrace!);
+    }
+  }
 
   void _startFailureCleanup(HuddleSessionState session) {
     final cleanup = _cleanupAfterLocalTeardown(session);
